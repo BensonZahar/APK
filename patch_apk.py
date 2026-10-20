@@ -6,9 +6,13 @@ patch_apk.py — вшивает мод «игроки рядом» в Hassle_Onl
 
 Что делает
   • если на входе .001 — склеивает части (.001, .002, ...) в память/временный файл;
-  • для каждой ABI: lib/<abi>/libHassleExtended.so переименовывает в libHassleExtend2.so
-    (наш мод при загрузке сам подгрузит его и передаст JNI_OnLoad), а на его место кладёт новый .so;
-    если оригинала для этой ABI нет — просто добавляет новый;
+  • для каждой ABI выбирает режим сам:
+      1) СТАРЫЙ КЛИЕНТ (в APK есть lib/<abi>/libHassleExtended.so): оригинал переименовывается в libHassleExtend2.so,
+         на его место кладётся наш .so (при загрузке он сам подгрузит оригинал и передаст ему JNI_OnLoad);
+      2) ЧИСТЫЙ APK (libHassleExtended.so нет, но есть lib/<abi>/libmain.so — Unity): оригинальный libmain.so
+         переименовывается в libHassleMain2.so, а наш .so кладётся под именем libmain.so. Игра грузит libmain.so первой,
+         наш JNI_OnLoad грузит оригинал и передаёт ему тот же вызов;
+      3) если нет ни того, ни другого — эта ABI пропускается (лишняя папка lib/<abi> могла бы сбить выбор архитектуры);
   • убирает старую подпись META-INF (MANIFEST.MF, *.SF, *.RSA/DSA/EC);
   • .so пишет без сжатия и с выравниванием 4096, остальное выравнивает по 4 (как zipalign);
   • остальные записи копирует байт-в-байт, без перепаковки.
@@ -96,13 +100,26 @@ def main():
         out_ents.append(e)
     for abi, blob in libs.items():
         orig = 'lib/%s/libHassleExtended.so' % abi
-        moved = False
-        for e in out_ents:
-            if e.name == orig:
-                e.name = 'lib/%s/libHassleExtend2.so' % abi
-                moved = True; break
-        print('%s: оригинал %s' % (abi, 'переименован в libHassleExtend2.so' if moved else 'не найден — добавляю только наш'))
-        out_ents.append(new_entry(orig, blob))
+        unity = 'lib/%s/libmain.so' % abi
+        have = {e.name for e in out_ents}
+        if ('lib/%s/libHassleExtend2.so' % abi) in have or ('lib/%s/libHassleMain2.so' % abi) in have:
+            sys.exit('%s: APK уже пропатчен (есть libHassleExtend2.so / libHassleMain2.so). Возьмите чистый оригинал.' % abi)
+        if orig in have:
+            for e in out_ents:
+                if e.name == orig:
+                    e.name = 'lib/%s/libHassleExtend2.so' % abi
+                    break
+            print('%s: режим СТАРОГО КЛИЕНТА: libHassleExtended.so -> libHassleExtend2.so, наш .so на его месте' % abi)
+            out_ents.append(new_entry(orig, blob))
+        elif unity in have:
+            for e in out_ents:
+                if e.name == unity:
+                    e.name = 'lib/%s/libHassleMain2.so' % abi
+                    break
+            print('%s: режим ЧИСТОГО APK: libmain.so -> libHassleMain2.so, наш .so под именем libmain.so' % abi)
+            out_ents.append(new_entry(unity, blob))
+        else:
+            print('%s: в APK нет ни libHassleExtended.so, ни libmain.so — эту архитектуру пропускаю' % abi)
 
     with open(src_path, 'rb') as fin, open(a.out, 'wb') as fo:
         cd = []

@@ -2,8 +2,12 @@
  * hassle_near.c — мод «игроки рядом» для Hassle Online (IL2CPP, Unity).
  *
  * Как это работает
- *   • Библиотека называется libHassleExtended.so — её уже грузит игра (System.loadLibrary("HassleExtended")).
- *     Оригинальный мод переименован в libHassleExtend2.so; из нашего JNI_OnLoad он загружается и получает тот же вызов.
+ *   • Два режима загрузки (patch_apk.py выбирает сам):
+ *     1) Старый клиент: библиотека называется libHassleExtended.so — её уже грузит игра (System.loadLibrary("HassleExtended")).
+ *        Оригинальный мод переименован в libHassleExtend2.so; из нашего JNI_OnLoad он загружается и получает тот же вызов.
+ *     2) Чистый APK (Unity 2021.3, libHassleExtended.so в нём нет): мы подменяем libmain.so — её игра грузит первой
+ *        (System.loadLibrary("main")). Оригинальный libmain.so переименован в libHassleMain2.so; наш JNI_OnLoad грузит его
+ *        и передаёт ему тот же вызов — он, как и раньше, регистрирует NativeLoader и сам поднимает libunity/libil2cpp.
  *   • Фоновый поток присоединяется к IL2CPP (il2cpp_thread_attach), находит Hassle.Global.Pooling.PlayerPool и раз в 300 мс
  *     читает PlayersInStream (игроки, которых клиент «видит» рядом): ID, ник из подписи над головой, позицию из
  *     последнего пакета синхронизации, HP/броню, пинг и счёт.
@@ -844,18 +848,23 @@ typedef int (*jni_onload_t)(void*, void*);
 typedef void (*jni_onunload_t)(void*, void*);
 static void* g_orig;
 
-/* Оригинальный мод лежит рядом под именем libHassleExtend2.so */
+/* Оригинал лежит рядом: libHassleExtend2.so (старый клиент) или libHassleMain2.so (чистый APK, подмена libmain.so) */
 EXPORT int JNI_OnLoad(void* vm, void* reserved) {
     int ver = 0x00010006;                                  /* JNI_VERSION_1_6 */
     init_log();
-    dlog("JNI_OnLoad: вход, грузим оригинал libHassleExtend2.so");
+    dlog("JNI_OnLoad: вход, грузим оригинал (libHassleExtend2.so / libHassleMain2.so)");
     g_orig = dlopen("libHassleExtend2.so", RTLD_NOW_);
+    if (g_orig) dlog("JNI_OnLoad: режим старого клиента (libHassleExtend2.so)");
+    else {
+        g_orig = dlopen("libHassleMain2.so", RTLD_NOW_);
+        if (g_orig) dlog("JNI_OnLoad: режим чистого APK (libHassleMain2.so = оригинальный libmain.so)");
+    }
     if (g_orig) {
         jni_onload_t f = (jni_onload_t)dlsym(g_orig, "JNI_OnLoad");
         dlog("JNI_OnLoad: оригинал загружен, вызываю его JNI_OnLoad");
         if (f) ver = f(vm, reserved);
         dlog_i("JNI_OnLoad: оригинал вернул версию ", ver);
-    } else dlog("JNI_OnLoad: оригинал libHassleExtend2.so НЕ загрузился");
+    } else dlog("JNI_OnLoad: оригинал (libHassleExtend2.so / libHassleMain2.so) НЕ загрузился");
     start_threads();
     dlog("JNI_OnLoad: выход");
     return ver;
