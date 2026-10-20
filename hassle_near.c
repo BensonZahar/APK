@@ -9,6 +9,9 @@
  *     последнего пакета синхронизации, HP/броню, пинг и счёт.
  *   • Второй поток — крошечный HTTP-сервер на 127.0.0.1:17771 (порты 17771..17780). HUD (Code3.js) опрашивает
  *     http://127.0.0.1:17771/near  и получает JSON. Ничего из IL2CPP на главный поток не навешивается — игру это не трогает.
+ *   • Реконнект: GET /rec?t=N (N = секунд до подключения, 5..600, по умолчанию 5) делает то же, что команда /rec оригинального
+ *     мода: Game.Network.OnApplicationQuit() (шлёт серверу ID_DISCONNECTION_NOTIFICATION, если State == Connected), затем
+ *     Game.Network.DelayedConnect(m_Host, m_Port, m_Password, m_NickName, N). В Code3.js — команда /rec2 [секунд].
  *
  * Только IL2CPP C API (экспортируется libil2cpp.so) — исходники игры и BNM не нужны, классы ищутся по имени.
  * Код не использует libc-заголовки: прототипы объявлены вручную, поэтому собирается обычным clang без NDK.
@@ -40,6 +43,7 @@ extern int pthread_create(unsigned long*, const void*, void* (*)(void*), void*);
 extern int usleep(unsigned);
 extern int open(const char*, int, ...);
 extern long read(int, void*, unsigned long);
+extern long time(long*);
 
 #define RTLD_NOW_ 2
 #define NEAR_PORT_FIRST 17771
@@ -667,6 +671,114 @@ static void respond(int fd, const char* status, const char* ctype, const char* b
 
 static char g_diag_out[24576 + 1024];
 
+/* ───────────── реконнект: GET /rec?t=N ─────────────
+   Повторяет Hassle::Commands::Reconnect оригинального libHassleExtended (/rec): берёт Game.Network (static), читает
+   m_Host/m_Port/m_Password/m_NickName, вызывает OnApplicationQuit() (посылает ID_DISCONNECTION_NOTIFICATION, если State == 2)
+   и DelayedConnect(host, port, password, nick, секунды) — внутри UniTask.Delay(N) и затем NetworkClient.Connect(...). */
+static __thread int tl_attached;
+static long g_recUntil;                 /* до какого времени (time()) предыдущий реконнект ещё «в работе» */
+static char g_rec_out[1024];
+
+static int query_int(const char* rq, const char* key, int dflt) {
+    const char* q; unsigned kl = slen(key);
+    for (q = rq; *q && *q != '\r' && *q != '\n'; q++) {
+        if ((*q == '?' || *q == '&') && sprefix(q + 1, key) && q[1 + kl] == '=') {
+            int v = 0, d = 0; const char* p = q + 2 + kl;
+            while (*p >= '0' && *p <= '9' && v < 100000) { v = v * 10 + (*p - '0'); p++; d++; }
+            return d ? v : dflt;
+        }
+    }
+    return dflt;
+}
+static void exc_text(void* exc, char* out, int cap) {
+    void* m; void* e2 = NULL; void* s;
+    out[0] = 0;
+    if (!exc) return;
+    m = find_method(A.object_get_class(exc), "ToString", 0);
+    if (!m) return;
+    s = A.runtime_invoke(m, exc, NULL, &e2);
+    if (e2 || !s) return;
+    { int n = A.string_length(s); if (n > 240) n = 240; utf16_to_utf8(A.string_chars(s), n, out, cap); }
+}
+static void rec_fail(int c, const char* why) {
+    Buf b; b_init(&b, g_rec_out, sizeof g_rec_out);
+    b_s(&b, "{\"ok\":0,\"why\":"); b_jstr(&b, why); b_ch(&b, '}');
+    dlog2("реконнект: отказ: ", why);
+    respond(c, "200 OK", "application/json", g_rec_out, b.n);
+}
+static void handle_rec(int c, const char* rq) {
+    int t = query_int(rq, "t", 5), state = -1, port = 0, quit_called = 0;
+    void *cg, *fn, *nc = NULL, *nk, *mq, *md, *exc = NULL;
+    void *host, *pw, *nick; int ok = 0;
+    unsigned short port16; float tf;
+    char et[256]; long now;
+
+    if (t < 5) t = 5;
+    if (t > 600) t = 600;
+    if (!g_il2cpp || !g_domain || !g_img) { rec_fail(c, "мод ещё не готов (игра грузится, подождите)"); return; }
+    now = time(NULL);
+    if (now < g_recUntil) { rec_fail(c, "реконнект уже запущен, подождите"); return; }
+    if (!tl_attached) { A.thread_attach(g_domain); tl_attached = 1; }
+
+    cg = A.class_from_name(g_img, "Hassle", "Game");
+    if (!cg) { rec_fail(c, "класс Hassle.Game не найден"); return; }
+    fn = A.class_get_field_from_name(cg, "Network");
+    if (!fn) { rec_fail(c, "поле Game.Network не найдено"); return; }
+    A.field_static_get_value(fn, &nc);
+    if (!nc) { rec_fail(c, "Game.Network = null (вы не на сервере?)"); return; }
+    nk = A.object_get_class(nc);
+
+    state = (int)num_field(nc, "State", &ok);
+    host = ref_field(nc, "m_Host");
+    pw = ref_field(nc, "m_Password");
+    nick = ref_field(nc, "m_NickName");
+    port = (int)num_field(nc, "m_Port", &ok);
+    if (!host || !nick) { rec_fail(c, "нет данных подключения (m_Host/m_NickName пусты)"); return; }
+    mq = find_method(nk, "OnApplicationQuit", 0);
+    md = find_method(nk, "DelayedConnect", 5);
+    if (!mq || !md) { rec_fail(c, !md ? "метод DelayedConnect не найден" : "метод OnApplicationQuit не найден"); return; }
+
+    dlog_i("реконнект: старт, секунд ", t);
+    dlog_i("реконнект: State ", state);
+    dlog_i("реконнект: порт ", port);
+
+    /* 1) корректный выход с сервера (внутри сам проверяет State == Connected) */
+    exc = NULL;
+    A.runtime_invoke(mq, nc, NULL, &exc);
+    if (exc) { exc_text(exc, et, sizeof et); dlog2("реконнект: OnApplicationQuit бросил: ", et); }
+    else quit_called = 1;
+
+    /* 2) подключение через N секунд */
+    port16 = (unsigned short)port; tf = (float)t;
+    {
+        void* args[5];
+        args[0] = host; args[1] = &port16; args[2] = pw; args[3] = nick; args[4] = &tf;
+        exc = NULL;
+        A.runtime_invoke(md, nc, args, &exc);
+    }
+    if (exc) {
+        Buf b;
+        exc_text(exc, et, sizeof et);
+        dlog2("реконнект: DelayedConnect бросил: ", et);
+        b_init(&b, g_rec_out, sizeof g_rec_out);
+        b_s(&b, "{\"ok\":0,\"why\":\"DelayedConnect: исключение\",\"exc\":"); b_jstr(&b, et); b_ch(&b, '}');
+        respond(c, "200 OK", "application/json", g_rec_out, b.n);
+        return;
+    }
+    g_recUntil = now + t + 10;
+    {
+        Buf b; b_init(&b, g_rec_out, sizeof g_rec_out);
+        b_s(&b, "{\"ok\":1,\"t\":"); b_int(&b, t);
+        b_s(&b, ",\"state\":"); b_int(&b, state);
+        b_s(&b, ",\"port\":"); b_int(&b, port);
+        b_s(&b, ",\"quit\":"); b_int(&b, quit_called);
+        b_ch(&b, '}');
+        dlog("реконнект: DelayedConnect запущен");
+        respond(c, "200 OK", "application/json", g_rec_out, b.n);
+    }
+}
+
+
 static void handle_diag(int c) {
     Buf b;
     b_init(&b, g_diag_out, sizeof g_diag_out);
@@ -703,6 +815,7 @@ static void* server_main(void* arg) {
                 rq[n] = 0;
                 if (sprefix(rq, "OPTIONS ")) respond(c, "204 No Content", "text/plain", "", 0);
                 else if (sprefix(rq, "GET /near")) { const char* j = g_json[g_jsonCur]; respond(c, "200 OK", "application/json", j, slen(j)); }
+                else if (sprefix(rq, "GET /rec")) handle_rec(c, rq);
                 else if (sprefix(rq, "GET /diag")) handle_diag(c);
                 else if (sprefix(rq, "GET /ping")) respond(c, "200 OK", "text/plain", "hassle-near", 11);
                 else respond(c, "404 Not Found", "text/plain", "no", 2);
